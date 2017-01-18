@@ -1,39 +1,38 @@
-"""
-This code is an example of how to train MNIST classification.
-The most easiest deep learning example.
-Good to learn how to use LemonTree.
-"""
-
-import time
 import numpy as np
 import theano
 import theano.tensor as T
+import time
 
 from lemontree.data.mnist import MNIST
 from lemontree.data.generators import SimpleGenerator
 from lemontree.controls.history import HistoryWithEarlyStopping
 from lemontree.controls.scheduler import LearningRateMultiplyScheduler
-from lemontree.graphs.graph import SimpleGraph
-from lemontree.layers.activation import ReLU, Softmax
-from lemontree.experimentals.gumbel_softmax import GumbelSoftmax
-from lemontree.layers.dense import DenseLayer
-from lemontree.layers.normalization import BatchNormalization1DLayer
-from lemontree.initializers import HeNormal
+from lemontree.initializers import *
 from lemontree.objectives import CategoricalAccuracy, CategoricalCrossentropy
-from lemontree.optimizers import Adam
 from lemontree.parameters import SimpleParameter
 from lemontree.utils.param_utils import filter_params_by_tags, print_tags_in_params
 from lemontree.utils.type_utils import merge_dicts
 from lemontree.utils.graph_utils import get_inputs_of_variables
 
+from graph import SimpleGraph
+from layers import FixedDenseLayer
+from optimizers import Adam
+from weight_processing import *
+from activation import ReLU, Softmax
+
+
 
 np.random.seed(9999)
-base_datapath = 'D:/boo/data/'
-experiment_name = 'mnist_mlp'
+base_path = 'D:/boo/theano_data/'
+experiment_name = 'mnist_mlp_fixed'
 
+data_path = base_path + 'data/'
+model_path = base_path + 'models/mnist_final_20.h5'
+
+n_bits_w_all = 2
 #================Prepare data================#
 
-mnist = MNIST(base_datapath, 'flat')
+mnist = MNIST(data_path, 'flat')
 mnist.split_train_valid(50000)
 train_data, train_label = mnist.get_fullbatch_train()
 test_data, test_label = mnist.get_fullbatch_test()
@@ -51,43 +50,81 @@ valid_gen.initialize(valid_data, valid_label)
 x = T.fmatrix('X')
 y = T.ivector('y')
 
+
+
+param_source = parameters_h5(model_path)
+
+
 graph = SimpleGraph(experiment_name)
 graph.add_input(x)
-graph.add_layers([DenseLayer((784,),(1024,), use_bias=False, name='dense1'),
-                  BatchNormalization1DLayer((1024,), 0.9, name='bn1'),
-                  ReLU(name='relu1'),
-                  DenseLayer((1024,),(1024,), use_bias=False, name='dense2'),
-                  BatchNormalization1DLayer((1024,), 0.9, name='bn2'),
-                  ReLU(name='relu2'),
-                  DenseLayer((1024,),(1024,), use_bias=False, name='dense3'),
-                  BatchNormalization1DLayer((1024,), 0.9, name='bn3'),
-                  ReLU(name='relu3'),
-                  DenseLayer((1024,),(1024,), use_bias=False, name='dense4'),
-                  BatchNormalization1DLayer((1024,), 0.9, name='bn4'),
-                  ReLU(name='relu4'),
-                  DenseLayer((1024,),(10,), name='dense5'),
-                  Softmax(name='softmax1')])
+graph.add_layers([
+    FixedDenseLayer(
+        input_shape = (784,),
+        output_shape = (20,),
+        W = param_source.load_param('W', 1, 'dense'),
+        b = param_source.load_param('b', 1, 'dense'),
+        n_bits_w = n_bits_w_all,
+        name='dense1'),
+    ReLU(name='relu1'),
+    
+    FixedDenseLayer(
+        input_shape = (20,),
+        output_shape = (20,),
+        W = param_source.load_param('W', 2, 'dense'),
+        b = param_source.load_param('b', 2, 'dense'),
+        n_bits_w = n_bits_w_all,
+        name='dense2'),
+    ReLU(name='relu2'),
+    
+    
+    FixedDenseLayer(
+        input_shape = (20,),
+        output_shape = (10,),
+        W = param_source.load_param('W', 3, 'dense'),
+        b = param_source.load_param('b', 3, 'dense'),
+        n_bits_w = n_bits_w_all,
+        name='dense3'),
+    Softmax(name='softmax1')])
+
 
 loss = CategoricalCrossentropy().get_loss(graph.get_output(), y)
 accuracy = CategoricalAccuracy().get_loss(graph.get_output(), y)
 
-graph_params = graph.get_params()
+
+
+graph_params_fixed = graph.get_params_fixed()
+graph_params_float = graph.get_params_float()
 graph_updates = graph.get_updates()
+graph_quantize = graph.get_fixed_updates()
 
-#================Prepare arguments================#
 
-HeNormal().initialize_params(filter_params_by_tags(graph_params, ['weight']))
-print_tags_in_params(graph_params)
+
+
+
+#print('fixed')
+#print(graph_params_fixed)
+#print('float')
+#print(graph_params_float)
+
+
+
+
+#====================Prepare arguments===================#
+
 
 optimizer = Adam(0.002)
 optimizer_params = optimizer.get_params()
-optimizer_updates = optimizer.get_updates(loss, graph_params)
+optimizer_updates = optimizer.get_updates(loss, graph_params_fixed, graph_params_float)
 
-total_params = optimizer_params + graph_params
+total_params = optimizer_params + graph_params_float
 total_updates = merge_dicts([optimizer_updates, graph_updates])
 
+############################
+#have to add step size params
+#Q : save optimizer params?
+############################
 params_saver = SimpleParameter(total_params, experiment_name + '_params/')
-params_saver.save_params()
+#params_saver.save_params()
 
 lr_scheduler = LearningRateMultiplyScheduler(optimizer.lr, 0.2)
 hist = HistoryWithEarlyStopping(experiment_name + '_history/', 5, 5)
@@ -107,6 +144,11 @@ test_func = theano.function(inputs=graph_inputs,
                             outputs=outputs,
                             allow_input_downcast=True)
 
+quantize_func = theano.function(inputs = [],
+                                outputs = [],
+                                updates = graph_quantize
+                                )
+
 #================Convenient functions================#
 
 def train_trainset():
@@ -116,6 +158,7 @@ def train_trainset():
     for index in range(train_gen.max_index):
         trainset = train_gen.get_minibatch(index)
         train_batch_loss, train_batch_accuracy = train_func(*trainset)
+        quantize_func()
         train_loss.append(train_batch_loss)
         train_accuracy.append(train_batch_accuracy)
     hist.history['train_loss'].append(np.mean(np.asarray(train_loss)))
@@ -146,10 +189,15 @@ def test_testset():
     hist.history['test_accuracy'].append(np.mean(np.asarray(test_accuracy)))
 
 #================Train================#
+quantize_func()
+graph.show_fixed_params()
+test_testset()
+print('direct quntization results')
+hist.print_history_of_epoch()
 
 change_lr = False
 end_train = False
-for epoch in range(1000):
+for epoch in range(50):
     if end_train:
         params_saver.load_params()
         break
@@ -162,6 +210,7 @@ for epoch in range(1000):
     print('...Epoch', epoch)
     start_time = time.clock()
 
+    test_testset()
     train_trainset()
     test_validset()
 
@@ -169,7 +218,8 @@ for epoch in range(1000):
     print('......time:', end_time - start_time)
 
     hist.print_history_of_epoch()
-    checker = hist.check_earlystopping()
+#    checker = hist.check_earlystopping()
+    checker = 'keep_train'
     if checker == 'save_param':
         params_saver.save_params()
         change_lr = False
